@@ -6,6 +6,7 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+#include "driver/i2c_master.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -49,6 +50,69 @@ static const char *REQUEST_TEMPLATE = "POST " WEB_PATH " HTTP/1.0\r\n"
                                       "\r\n"
                                       "%s";
 
+#define I2C_MASTER_SCL_IO 8
+#define I2C_MASTER_SDA_IO 10
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 400000
+#define I2C_MASTER_TIMEOUT_MS 1000
+#define TEMP_SENSOR_ADDR 0x70
+#define SHTC3_MEASURE_CMD 0x7CA2
+
+// Ultrasonic pins
+
+#define TRIG_PIN GPIO_NUM_3
+#define ECHO_PIN GPIO_NUM_2
+
+i2c_master_bus_handle_t bus_handle;
+i2c_master_dev_handle_t dev_handle;
+
+// I2C initialization
+
+static void i2c_master_init(void) {
+
+  i2c_master_bus_config_t bus_config = {
+      .i2c_port = I2C_MASTER_NUM,
+      .sda_io_num = I2C_MASTER_SDA_IO,
+      .scl_io_num = I2C_MASTER_SCL_IO,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .flags.enable_internal_pullup = true,
+
+  };
+
+  ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
+  i2c_device_config_t dev_config = {
+      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+      .device_address = TEMP_SENSOR_ADDR,
+      .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+  };
+
+  ESP_ERROR_CHECK(
+      i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
+}
+
+// Read temperature from SHTC3
+
+esp_err_t read_temperature_celsius(float *temp_celsius) {
+  ESP_ERROR_CHECK(i2c_master_transmit(
+      dev_handle,
+      (uint8_t[]){(SHTC3_MEASURE_CMD >> 8), (SHTC3_MEASURE_CMD & 0xFF)}, 2,
+      I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS));
+
+  vTaskDelay(pdMS_TO_TICKS(20));
+  uint8_t data[6] = {0};
+  esp_err_t err =
+      i2c_master_receive(dev_handle, data, sizeof(data),
+                         I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+  if (err != ESP_OK)
+    return err;
+
+  uint16_t raw_temp = (data[0] << 8) | data[1];
+  *temp_celsius = -45 + 175 * ((float)raw_temp / 65535);
+
+  return ESP_OK;
+}
+
 // send POST to phone
 static void http_post_task(void *pvParameters) {
   const struct addrinfo hints = {
@@ -59,9 +123,24 @@ static void http_post_task(void *pvParameters) {
   struct in_addr *addr;
   int s, r;
   char recv_buf[64];
+  i2c_master_init();
 
   while (1) {
-    //FOR GET REQUEST FROM WEATHER
+    // READ TEMPERATURE AND HUMIDITY SENSOR
+    float temp_c = 0;
+    if (read_temperature_celsius(&temp_c) != ESP_OK) {
+      ESP_LOGE(TAG, "Temperature read failed");
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    ESP_LOGI(TAG, "Local temperature is %.2fC", temp_c);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // END OF SHTC3 SENSOR
+    //=============================
+    //  FOR GET REQUEST FROM WEATHER
     int err = getaddrinfo(WEATHER_SERVER, WEATHER_PORT, &hints, &res);
 
     if (err != 0 || res == NULL) {
@@ -126,9 +205,17 @@ static void http_post_task(void *pvParameters) {
         strncat(POST_PAYLOAD, recv_buf, r);
       }
     } while (r > 0);
+        
+    //add local weather data
+    char local[64];
+    snprintf(local, sizeof(local), "Local temperature is %.2fC", temp_c);
+    strncat(POST_PAYLOAD, local, sizeof(POST_PAYLOAD) - strlen(POST_PAYLOAD) - 1);
+    
+    ESP_LOGI(TAG, "Local temperature is %.2fC", temp_c);
 
-    ESP_LOGI(TAG_WEATHER, "... done reading from socket. Last read return=%d errno=%d.",
-             r, errno);
+    ESP_LOGI(TAG_WEATHER,
+             "... done reading from socket. Last read return=%d errno=%d.", r,
+             errno);
     close(s);
     //
     // =====================================================
